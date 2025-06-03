@@ -105,12 +105,16 @@ public:
 
 protected:
   void sendRequest(int port);
+  void sendResponseBroadcast(int port);
+  int getPortByModuleName(const std::string &name);
+  void updateRoutingTable(int port, ipv4_t sender_ip, const std::vector<rip_entry_t>& entries);
   virtual std::any diagnose(std::any param) final {
     auto ip = std::any_cast<ipv4_t>(param);
     return ripQuery(ip);
   }
   virtual void packetArrived(std::string fromModule, Packet &&packet) final;
 };
+
 
 } // namespace E
 
