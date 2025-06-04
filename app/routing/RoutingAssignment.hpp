@@ -74,8 +74,8 @@ class RoutingAssignment : public HostModule,
 
 private:
   virtual void timerCallback(std::any payload) final;
-  std::unordered_map<int, ipv4_t> interfaces;
-  std::unordered_map<uint32_t, RouteEntry> table;
+  std::vector<struct rip_entry_t> distance_vector_table;
+  std::vector<ipv4_t> my_ips;
 
 public:
   RoutingAssignment(Host &host);

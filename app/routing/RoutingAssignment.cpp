@@ -3,20 +3,20 @@
  *
  */
 
+#include "RoutingAssignment.hpp"
 #include <E/E_Common.hpp>
+#include <E/E_TimeUtil.hpp>
 #include <E/Networking/E_Host.hpp>
 #include <E/Networking/E_NetworkUtil.hpp>
 #include <E/Networking/E_Networking.hpp>
 #include <E/Networking/E_Packet.hpp>
+#include <arpa/inet.h>
 #include <cerrno>
+#include <netinet/udp.h>
 
-#include "RoutingAssignment.hpp"
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
 namespace E {
-
-static uint32_t ipToKey(const ipv4_t &ip) {
-  return *reinterpret_cast<const uint32_t *>(&ip);
-}
 
 RoutingAssignment::RoutingAssignment(Host &host)
     : HostModule("UDP", host), RoutingInfoInterface(host),
@@ -24,218 +24,56 @@ RoutingAssignment::RoutingAssignment(Host &host)
 
 RoutingAssignment::~RoutingAssignment() {}
 
-void RoutingAssignment::sendRequest(int port) {
-  // RIP 헤더 설정
-  rip_header_t header;
-  header.command = 1; // request
-  header.version = 1; // RIPv1
-  header.zero_0 = 0;
-
-  // RIP entry 설정
-  rip_entry_t entry;
-  entry.address_family = htons(0); // IP
-  entry.zero_1 = 0;
-  entry.ip_addr = 0; // 0.0.0.0
-  entry.zero_2 = 0;
-  entry.zero_3 = 0;
-  entry.metric = 0; // infinite
-
-  // RIP 페이로드 크기 계산
-  size_t rip_size = sizeof(header) + sizeof(entry);
-
-  // UDP 헤더 설정
-  struct udp_header_t {
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint16_t len;
-    uint16_t checksum;
-  } __attribute__((packed));
-
-  udp_header_t udp_hdr;
-  udp_hdr.src_port = htons(520);
-  udp_hdr.dst_port = htons(520);
-  udp_hdr.len = htons(rip_size + sizeof(udp_header_t));
-  udp_hdr.checksum = 0;
-
-  // 전체 패킷 생성 (UDP 헤더 + RIP 페이로드)
-  Packet packet(sizeof(udp_hdr) + rip_size + 20 + 8);
-  ipv4_t srcIp = getIPAddr(port).value();
-  std::cout << "srcIp = " << static_cast<unsigned int>(srcIp[0]) << "."
-            << static_cast<unsigned int>(srcIp[1]) << "."
-            << static_cast<unsigned int>(srcIp[2]) << "."
-            << static_cast<unsigned int>(srcIp[3]) << std::endl;
-  ipv4_t broadCastIp{255, 255, 255, 255};
-
-  packet.writeData(0, srcIp.data(), 4);
-  packet.writeData(4, broadCastIp.data(), 4);
-  size_t offset = 8;
-  packet.writeData(offset, &udp_hdr, sizeof(udp_hdr));
-  offset += sizeof(udp_hdr);
-  packet.writeData(offset, &header, sizeof(header));
-  offset += sizeof(header);
-  packet.writeData(offset, &entry, sizeof(entry));
-
-  std::cout << "packet.getSize() = " << packet.getSize() << std::endl;
-
-  // 패킷 전송: UDP 모듈로 전송
-  sendPacket("UDP", std::move(packet));
-}
-
-void debugPrintRIPPacket(const E::Packet &packet) {
-  size_t totalSize = packet.getSize();
-  if (totalSize < 12) {
-    // std::cout << "[RIP DEBUG] Too small for RIP+UDP header: " << totalSize
-    //           << " bytes\n";
-    return;
-  }
-
-  // 1. UDP Header (8 bytes)
-  struct udp_header_t {
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint16_t len;
-    uint16_t checksum;
-  } __attribute__((packed));
-
-  udp_header_t udp;
-  packet.readData(0, &udp, sizeof(udp));
-  // std::cout << "[UDP Header]\n";
-  // std::cout << "  src_port: " << ntohs(udp.src_port)
-  //           << ", dst_port: " << ntohs(udp.dst_port)
-  //           << ", len: " << ntohs(udp.len) << ", checksum: 0x" << std::hex
-  //           << ntohs(udp.checksum) << std::dec << "\n";
-
-  // 2. RIP Header (4 bytes)
-  if (totalSize < 12)
-    return;
-  E::rip_header_t rip_header;
-  packet.readData(8, &rip_header, sizeof(rip_header));
-  // std::cout << "[RIP Header]\n";
-  // std::cout << "  command: " << static_cast<int>(rip_header.command)
-  //           << ", version: " << static_cast<int>(rip_header.version)
-  //           << ", zero: " << rip_header.zero_0 << "\n";
-
-  // 3. RIP entries (20 bytes each)
-  size_t offset = 12;
-  int index = 0;
-  while (offset + sizeof(E::rip_entry_t) <= totalSize) {
-    E::rip_entry_t entry;
-    packet.readData(offset, &entry, sizeof(entry));
-    offset += sizeof(entry);
-
-    E::ipv4_t ip;
-    memcpy(&ip, &entry.ip_addr, sizeof(ip));
-
-    // std::cout << "[RIP Entry " << index++ << "] "
-    //           << "IP = " << static_cast<int>(ip[0]) << "."
-    //           << static_cast<int>(ip[1]) << "." << static_cast<int>(ip[2])
-    //           << "." << static_cast<int>(ip[3])
-    //           << ", metric = " << ntohl(entry.metric) << "\n";
-  }
-}
-
-void RoutingAssignment::sendResponseBroadcast(int port) {
-  // std::cout << "sendResponseBroadcast called" << std::endl;
-  // RIP 응답 헤더
-  rip_header_t header;
-  header.command = 2; // response
-  header.version = 1;
-  header.zero_0 = 0;
-
-  // RIP entry 목록 만들기
-  std::vector<rip_entry_t> entries;
-
-  for (const auto &[key, entry] : table) {
-    rip_entry_t rip_entry;
-    memcpy(&rip_entry.ip_addr, &entry.destination, sizeof(uint32_t));
-
-    // std::cout << "rip_entry.ip_addr = " << rip_entry.ip_addr << std::endl;
-    rip_entry.address_family = htons(2);
-    rip_entry.zero_1 = 0;
-    rip_entry.zero_2 = 0;
-    rip_entry.zero_3 = 0;
-    rip_entry.metric = htonl(entry.cost > 15 ? 16 : entry.cost); // 최대 16
-    entries.push_back(rip_entry);
-  }
-
-  // 총 길이 계산
-  size_t rip_size = sizeof(rip_header_t) + entries.size() * sizeof(rip_entry_t);
-  size_t udp_size = rip_size + 8;
-
-  // UDP 헤더 작성
-  struct udp_header_t {
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint16_t len;
-    uint16_t checksum;
-  } __attribute__((packed));
-
-  udp_header_t udp_hdr;
-  udp_hdr.src_port = htons(520);
-  udp_hdr.dst_port = htons(520);
-  udp_hdr.len = htons(udp_size);
-  udp_hdr.checksum = 0;
-
-  // 전체 패킷 생성
-  Packet packet(sizeof(udp_hdr) + rip_size);
-  size_t offset = 0;
-  packet.writeData(offset, &udp_hdr, sizeof(udp_hdr));
-  offset += sizeof(udp_hdr);
-  packet.writeData(offset, &header, sizeof(header));
-  offset += sizeof(header);
-  for (const auto &e : entries) {
-    // std::cout << "e.ip_addr = " << e.ip_addr << std::endl;
-    packet.writeData(offset, &e, sizeof(e));
-    offset += sizeof(e);
-  }
-
-  sendPacket("UDP", std::move(packet));
-}
-
 void RoutingAssignment::initialize() {
-  std::cout << "initialize called" << std::endl;
-  // Host 객체 참조
+  ipv4_t broadCastIp = {255, 255, 255, 255};
 
-  // 포트 개수 조회
-  int port_count = getPortCount(); // HostModule::getPortCount()
+  for (int i = 0; i < getPortCount(); i++) {
+    ipv4_t source_ip = getIPAddr(i).value();
 
-  // 각 포트마다 작업 수행
-  for (int port = 0; port < port_count; ++port) {
-    auto ip_opt = getIPAddr(port); // HostModule::getIPAddr()
-    if (!ip_opt.has_value()) {
-      std::cout << "ip_opt: 없음" << std::endl;
-      continue;
-    }
+    struct rip_entry_t entry_t = {
+        .address_family = htons(2),
+        .zero_1 = 0,
+        .ip_addr = static_cast<uint32_t>(NetworkUtil::arrayToUINT64(source_ip)),
+        .zero_2 = 0,
+        .zero_3 = 0,
+        .metric = 0};
 
-    ipv4_t ip = ip_opt.value();
-    std::cout << "port = " << port << std::endl;
-    std::cout << "ip_opt: " << static_cast<unsigned int>(ip[0]) << "."
-              << static_cast<unsigned int>(ip[1]) << "."
-              << static_cast<unsigned int>(ip[2]) << "."
-              << static_cast<unsigned int>(ip[3]) << std::endl;
-    interfaces[port] = ip; // 포트-IP 매핑 저장
+    this->distance_vector_table.push_back(entry_t);
+    this->my_ips.push_back(source_ip);
 
-    // 자기 자신에 대한 라우팅 정보 추가
-    RouteEntry entry{.destination = ip,
-                     .prefix_len = 32,
-                     .cost = 0, // 본인은 거리 0
-                     .port = port,
-                     .last_updated = getCurrentTime()};
-    std::cout << "ipToKey(ip) = " << ipToKey(ip) << std::endl;
-    table[ipToKey(ip)] = entry;
+    struct rip_entry_t rip_entry_t = {.address_family = htons(0),
+                                      .zero_1 = 0,
+                                      .ip_addr = 0,
+                                      .zero_2 = 0,
+                                      .zero_3 = 0,
+                                      .metric = htonl(301)};
 
-    // 각 포트로 RIP Request 전송
-    sendRequest(port);
+    size_t packet_size = sizeof(udphdr) + sizeof(rip_header_t);
+    size_t udp_header_start_offset = 34;
+    Packet packet(udp_header_start_offset + packet_size);
+
+    // broadcast a request
+    packet.writeData(26, &source_ip, 4);   // source ipaddress
+    packet.writeData(30, &broadCastIp, 4); // destination ipaddress
+
+    struct udphdr udphdr = {.uh_sport = htons(520),
+                            .uh_dport = htons(520),
+                            .uh_sum = 0,
+                            .uh_ulen = htons(32)};
+
+    struct rip_header_t rip_header = {.command = 1, .version = 1, .zero_0 = 0};
+
+    udphdr.uh_sum = 0;
+    packet.writeData(34, &udphdr, sizeof(udphdr));
+    packet.writeData(38, &rip_header, sizeof(rip_header_t));
+
+    this->sendPacket("IPv4", std::move(packet));
   }
-  std::cout << "interfaces size = " << interfaces.size() << std::endl;
 
-  // 타이머 등록 (5초 주기 브로드캐스트)
-  addTimer(rand(), 30000000000);
+  this->addTimer("", TimeUtil::makeTime(30, TimeUtil::SEC));
 }
 
-void RoutingAssignment::finalize() {
-  std::cout << "finalize called" << std::endl;
-}
+void RoutingAssignment::finalize() {}
 
 /**
  * @brief Query cost for a host
@@ -244,191 +82,223 @@ void RoutingAssignment::finalize() {
  * @return cost or -1 for no found host
  */
 Size RoutingAssignment::ripQuery(const ipv4_t &ipv4) {
-  std::cout << "ripQuery called" << std::endl;
-  uint32_t key = ipToKey(ipv4);
-  std::cout << "key = " << key << std::endl;
-  auto it = table.find(key);
-  for (const auto &[k, e] : table) {
-    std::cout << "Entry: " << static_cast<int>(e.destination[0]) << "."
-              << static_cast<int>(e.destination[1]) << "."
-              << static_cast<int>(e.destination[2]) << "."
-              << static_cast<int>(e.destination[3]) << " cost = " << e.cost
-              << std::endl;
+
+  for (int i = 0; i < this->distance_vector_table.size(); i++) {
+    if (this->distance_vector_table[i].ip_addr ==
+        (uint32_t)NetworkUtil::arrayToUINT64(ipv4))
+      return ntohl(this->distance_vector_table[i].metric);
   }
 
-  if (it != table.end()) {
-    std::cout << "it->second.cost = " << it->second.cost << std::endl;
-    return it->second.cost;
-  }
-  return static_cast<Size>(-1); // 없으면 -1
-}
-
-int RoutingAssignment::getPortByModuleName(const std::string &name) {
-  for (const auto &[port, ip] : interfaces) {
-    if ("port" + std::to_string(port) == name)
-      return port;
-  }
-  return -1; // 오류 처리 필요 시
-}
-
-int RoutingAssignment::getPortBySenderIP(const ipv4_t &sender_ip) {
-  for (const auto &[key, entry] : table) {
-    if (memcmp(&entry.destination, &sender_ip, sizeof(ipv4_t)) == 0) {
-      return entry.port;
-    }
-  }
-
-  for (const auto &[key, entry] : table) {
-    if (memcmp(&entry.destination, &sender_ip, sizeof(ipv4_t)) == 0) {
-      return entry.port;
-    }
-  }
   return -1;
 }
 
-ipv4_t guessSenderIPFromEntries(const std::vector<rip_entry_t> &entries) {
-  for (const auto &entry : entries) {
-    if (ntohl(entry.metric) == 0) {
-      ipv4_t ip;
-      std::memcpy(&ip, &entry.ip_addr, sizeof(ipv4_t));
-      return ip;
-    }
-  }
-
-  // // fallback: 첫 엔트리 IP (없으면 0.0.0.0)
-  // if (!entries.empty()) {
-  //   ipv4_t ip;
-  //   std::memcpy(&ip, &entries[0].ip_addr, sizeof(ipv4_t));
-  //   return ip;
-  // }
-
-  return {0, 0, 0, 0};
-}
-
 void RoutingAssignment::packetArrived(std::string fromModule, Packet &&packet) {
+  ipv4_t dest_ip;
+  packet.readData(26, &dest_ip, 4);
 
-  // debugPrintRIPPacket(packet);
-  if (packet.getSize() < sizeof(rip_header_t))
-    return;
+  int port = getRoutingTable(dest_ip);
+  ipv4_t source_ip = getIPAddr(port).value();
 
-  rip_header_t header;
-  packet.readData(8, &header, sizeof(header));
+  struct udphdr udphdr;
+  packet.readData(34, &udphdr, sizeof(udphdr));
 
-  size_t offset = sizeof(header) + 16;
-  // std::cout << "offset = " << offset << std::endl;
-  size_t entry_count = (packet.getSize() - offset) / sizeof(rip_entry_t);
-  // std::cout << "entry_count = " << entry_count << std::endl;
-  if (entry_count == 0) {
-    // std::cout << "[packetArrived] No RIP entries, skip.\n";
-    return;
-  }
+  size_t length = ntohs(udphdr.uh_ulen);
+  int entry_count =
+      (length - sizeof(udphdr) - sizeof(rip_header_t)) / sizeof(rip_entry_t);
 
-  if ((packet.getSize() - offset) % sizeof(rip_entry_t) != 0)
-    return;
+  struct rip_t *rip_t = (struct rip_t *)malloc(
+      sizeof(struct rip_t) + sizeof(rip_entry_t) * entry_count);
+  packet.readData(34 + sizeof(udphdr), rip_t, length - 8);
 
-  std::vector<rip_entry_t> entries(entry_count);
-  for (size_t i = 0; i < entry_count; ++i) {
-    packet.readData(offset, &entries[i], sizeof(rip_entry_t));
-    offset += sizeof(rip_entry_t);
-  }
+  if (rip_t->header.command == 1) { // got request
+    size_t packet_size = sizeof(udphdr) + sizeof(rip_t);
+    Packet packetToSend(packet_size + 34);
 
-  ipv4_t sender_ip;
-  packet.readData(0, &sender_ip, 4);
-  std::cout << "sender_ip231 = " << static_cast<unsigned int>(sender_ip[0])
-            << "." << static_cast<unsigned int>(sender_ip[1]) << "."
-            << static_cast<unsigned int>(sender_ip[2]) << "."
-            << static_cast<unsigned int>(sender_ip[3]) << std::endl;
-  // std::cout << "sender_ip = " << static_cast<unsigned int>(sender_ip[0]) <<
-  // "."
-  //           << static_cast<unsigned int>(sender_ip[1]) << "."
-  //           << static_cast<unsigned int>(sender_ip[2]) << "."
-  //           << static_cast<unsigned int>(sender_ip[3]) << std::endl;
+    packetToSend.writeData(26, &source_ip, 4);
+    packetToSend.writeData(30, &dest_ip, 4);
 
-  // std::cout << "interfaces size = " << interfaces.size() << std::endl;
-  int port = getPortBySenderIP(sender_ip);
-  // std::cout << "port = " << port << std::endl;
+    udphdr.uh_ulen = htons(packet_size);
+    udphdr.uh_sum = 0;
 
-  for (const auto &[p, ip] : interfaces) {
-    if (ip == sender_ip) {
-      std::cout << "[packetArrived] Ignore self-originated RIP packet.\n";
-      return;
-    }
-  }
+    struct rip_t *send_rip_t = (struct rip_t *)malloc(
+        sizeof(struct rip_t) +
+        sizeof(rip_entry_t) * this->distance_vector_table.size());
 
-  std::cout << "패킷 도착 from " << fromModule
-            << ", size = " << packet.getSize() << std::endl;
+    send_rip_t->header.command = 2;
+    send_rip_t->header.version = 1;
+    send_rip_t->header.zero_0 = 0;
 
-  if (header.command == 1) {
-    std::cout << "[packetArrived] header.command = "
-              << static_cast<int>(header.command)
-              << ", size = " << packet.getSize() << std::endl;
-
-    sendResponseBroadcast(port);
-  } else if (header.command == 2) {
-    std::cout << "[packetArrived] Received RIP Response\n";
-
-    updateRoutingTable(port, sender_ip, entries);
-  }
-}
-
-void RoutingAssignment::updateRoutingTable(
-    int port, ipv4_t sender_ip, const std::vector<rip_entry_t> &entries) {
-  // std::cout << "updateRoutingTable called on port " << port << std::endl;
-
-  Size cost_to_sender = linkCost(port);
-
-  for (const auto &e : entries) {
-    ipv4_t dst;
-    memcpy(&dst, &e.ip_addr, sizeof(ipv4_t));
-    if (dst == interfaces[port]) {
-      continue; // 자기 자신 무시
+    for (int i = 0; i < this->distance_vector_table.size(); i++) {
+      send_rip_t->entries[i] = this->distance_vector_table[i];
     }
 
-    Size metric = ntohl(e.metric);
-    std::cout << "cost_to_sender = " << cost_to_sender << std::endl;
-    metric = std::min(Size(16), metric + cost_to_sender);
+    udphdr.uh_sum = 0;
+    packetToSend.writeData(34, &udphdr, sizeof(udphdr));
+    packetToSend.writeData(38, send_rip_t, packet_size - sizeof(udphdr));
 
-    std::cout << "metric = " << metric << std::endl;
-    uint32_t key = ipToKey(dst);
-    auto it = table.find(key);
+    this->sendPacket("IPv4", std::move(packetToSend));
 
-    if (metric >= 16) {
-      // infinite metric이면 제거
-      std::cout << "infinite metric" << std::endl;
-      if (it != table.end() && it->second.port == port) {
-        std::cout << "erase : " << std::endl;
-        table.erase(it);
+    free(send_rip_t);
+
+  } else if (rip_t->header.command == 2) { // got response
+    int changed = 0;                       //  any update exists?
+    for (int i = 0; i < entry_count; i++) {
+      struct rip_entry_t rip_entry_t; //  새로 들어갈 애
+      rip_entry_t.address_family = rip_t->entries[i].address_family;
+      rip_entry_t.ip_addr = rip_t->entries[i].ip_addr;
+      rip_entry_t.zero_1 = 0;
+      rip_entry_t.zero_2 = 0;
+      rip_entry_t.zero_3 = 0;
+
+      ipv4_t temp;
+      for (int j = 0; j < 4; j++) {
+        temp[j] = ((rip_entry_t.ip_addr >> j * 8) & 0xFF);
       }
-      continue;
-    }
 
-    Time now = getCurrentTime();
+      if (rip_t->entries[i].metric >= htonl(16)) { // unreachable
+        rip_entry_t.metric = htonl(16);
+      } else {
+        int port_num = getRoutingTable(dest_ip);
+        rip_entry_t.metric =
+            htonl(ntohl(rip_t->entries[i].metric) + linkCost(port_num));
+      }
 
-    if (it == table.end()) {
-      // 새로운 경로 추가
-      RouteEntry entry{dst, 32, metric, port, now};
-      table[key] = entry;
-    } else {
-      auto &existing = it->second;
-      if (existing.port == port || metric < existing.cost) {
-        existing.cost = metric;
-        existing.port = port;
-        existing.last_updated = now;
+      if (find(this->my_ips.begin(), this->my_ips.end(), temp) !=
+          this->my_ips.end()) { //  Is that my IP address?
+        continue;
+      }
+
+      int found = 0;
+
+      for (int j = 0; j < this->distance_vector_table.size(); j++) {
+        if (this->distance_vector_table[j].ip_addr == rip_entry_t.ip_addr) {
+          found = 1;
+          uint32_t old = this->distance_vector_table[j].metric;
+          this->distance_vector_table[j].metric =
+              htonl(MIN(ntohl(this->distance_vector_table[j].metric),
+                        ntohl(rip_entry_t.metric)));
+          if (old != this->distance_vector_table[j].metric) { // changed
+            changed = 1;
+          }
+        }
+      }
+      if (found == 0) {
+        changed = 1;
+        this->distance_vector_table.push_back(rip_entry_t);
       }
     }
+    if (changed == 1) { // notify change(s) to neighbors
+      for (int i = 0; i < getPortCount(); i++) {
+        size_t packet_size = 8 + 4 + 20 * this->distance_vector_table.size();
+        Packet pkt(packet_size + 34); // udp header 8bytes + rip_header 4bytes +
+                                      // rip_entries 20bytes each
+
+        ipv4_t dest_ip;
+        for (int j = 0; j < 4; j++) {
+          dest_ip[j] = (uint8_t)255;
+        }
+        std::optional<ipv4_t> ip = getIPAddr(i);
+        ipv4_t source_ip_send = ip.value();
+
+        if (source_ip == source_ip_send) {
+          continue;
+        }
+
+        size_t ip_start = 14;
+        pkt.writeData(ip_start + 12, &source_ip_send, 4); // source ipaddress
+        pkt.writeData(ip_start + 16, &dest_ip, 4); // destination ipaddress
+
+        struct udphdr udphdr;
+        udphdr.uh_sport = htons(520);
+        udphdr.uh_dport = htons(520);
+        udphdr.uh_ulen = htons(packet_size);
+        udphdr.uh_sum = 0;
+
+        struct rip_t *send_rip_t = (struct rip_t *)malloc(
+            sizeof(struct rip_t) + 20 * this->distance_vector_table.size());
+        send_rip_t->header.command = (uint8_t)2;
+        send_rip_t->header.version = (uint8_t)1;
+        send_rip_t->header.zero_0 = 0;
+
+        for (int i = 0; i < this->distance_vector_table.size(); i++) {
+          send_rip_t->entries[i] = this->distance_vector_table[i];
+        }
+
+        void *udp_packet = malloc(packet_size);
+        memcpy(udp_packet, &udphdr, 8);
+        memcpy((uint8_t *)udp_packet + 8, send_rip_t, packet_size - 8);
+
+        udphdr.uh_sum = 0;
+        memcpy(udp_packet, &udphdr, 8);
+
+        pkt.writeData(34, udp_packet, packet_size);
+
+        free(udp_packet);
+
+        this->sendPacket("IPv4", std::move(pkt));
+        free(send_rip_t);
+      }
+    }
   }
+  free(rip_t);
 }
 
 void RoutingAssignment::timerCallback(std::any payload) {
-  // 5초마다 모든 포트로 응답 브로드캐스트
-  for (const auto &[port, ip] : interfaces) {
-    // std::cout << "timerCallback port = " << port << std::endl;
-    // std::cout << "interfaces size = " << interfaces.size() << std::endl;
-    sendResponseBroadcast(port);
-  }
+  // broadcast response
+  for (int i = 0; i < getPortCount(); i++) {
+    size_t packet_size = 8 + 4 + 20 * this->distance_vector_table.size();
+    Packet pkt(
+        packet_size +
+        34); // udp header 8bytes + rip_header 4bytes + rip_entries 20bytes each
 
-  // 다시 타이머 등록 (5초 후)
-  addTimer(payload, 50000000);
+    ipv4_t dest_ip;
+    for (int j = 0; j < 4; j++) {
+      dest_ip[j] = (uint8_t)255;
+    }
+    int port = getRoutingTable(dest_ip);
+    std::optional<ipv4_t> ip = getIPAddr(port);
+    ipv4_t source_ip = ip.value();
+
+    size_t ip_start = 14;
+    pkt.writeData(ip_start + 12, &source_ip, 4); // source ipaddress
+    pkt.writeData(ip_start + 16, &dest_ip, 4);   // destination ipaddress
+
+    struct udphdr udphdr;
+    udphdr.uh_sport = htons(520);
+    udphdr.uh_dport = htons(520);
+    udphdr.uh_ulen = htons(packet_size);
+    udphdr.uh_sum = 0;
+
+    struct rip_t *rip_t = (struct rip_t *)malloc(
+        sizeof(struct rip_t) + 20 * this->distance_vector_table.size());
+    rip_t->header.command = (uint8_t)2;
+    rip_t->header.version = (uint8_t)1;
+    rip_t->header.zero_0 = 0;
+
+    for (int i = 0; i < this->distance_vector_table.size(); i++) {
+      rip_t->entries[i] = this->distance_vector_table[i];
+    }
+
+    void *udp_packet = malloc(packet_size);
+    memcpy(udp_packet, &udphdr, 8);
+    memcpy((uint8_t *)udp_packet + 8, rip_t, packet_size - 8);
+
+    uint16_t checksum =
+        NetworkUtil::tcp_sum((uint32_t)NetworkUtil::arrayToUINT64(source_ip),
+                             (uint32_t)NetworkUtil::arrayToUINT64(dest_ip),
+                             (uint8_t *)udp_packet, packet_size);
+    checksum = ~checksum;
+    checksum = htons(checksum);
+    udphdr.uh_sum = checksum;
+    memcpy(udp_packet, &udphdr, 8);
+
+    pkt.writeData(34, udp_packet, packet_size);
+
+    free(udp_packet);
+
+    this->sendPacket("IPv4", std::move(pkt));
+    free(rip_t);
+  }
 }
 
 } // namespace E
