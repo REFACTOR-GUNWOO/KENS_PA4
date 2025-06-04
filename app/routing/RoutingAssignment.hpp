@@ -33,9 +33,6 @@ struct RouteEntry {
   Time last_updated;
 };
 
-std::unordered_map<uint32_t, RouteEntry> table;
-std::unordered_map<int, ipv4_t> interfaces;
-
 struct rip_header_t {
   uint8_t command; // 1 - request, 2 - response, 3,4,5 - obsolete/unused
   uint8_t version; // 1 for RIPv1
@@ -74,8 +71,11 @@ __attribute__((packed));
 class RoutingAssignment : public HostModule,
                           private RoutingInfoInterface,
                           public TimerModule {
+
 private:
   virtual void timerCallback(std::any payload) final;
+  std::unordered_map<int, ipv4_t> interfaces;
+  std::unordered_map<uint32_t, RouteEntry> table;
 
 public:
   RoutingAssignment(Host &host);
@@ -104,17 +104,18 @@ public:
   virtual ~RoutingAssignment();
 
 protected:
+  int getPortBySenderIP(const ipv4_t &sender_ip);
   void sendRequest(int port);
   void sendResponseBroadcast(int port);
   int getPortByModuleName(const std::string &name);
-  void updateRoutingTable(int port, ipv4_t sender_ip, const std::vector<rip_entry_t>& entries);
+  void updateRoutingTable(int port, ipv4_t sender_ip,
+                          const std::vector<rip_entry_t> &entries);
   virtual std::any diagnose(std::any param) final {
     auto ip = std::any_cast<ipv4_t>(param);
     return ripQuery(ip);
   }
   virtual void packetArrived(std::string fromModule, Packet &&packet) final;
 };
-
 
 } // namespace E
 
